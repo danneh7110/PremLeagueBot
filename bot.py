@@ -4,6 +4,7 @@ from pathlib import Path
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
+from utils.emojis import team_name
 
 
 PROJECT_DIR = Path(__file__).parent
