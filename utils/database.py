@@ -48,6 +48,8 @@ class Database:
                     kickoff_utc TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'SCHEDULED',
                     result TEXT,
+                    home_score INTEGER,
+                    away_score INTEGER,
                     poll_channel_id INTEGER,
                     poll_message_id INTEGER,
                     scored INTEGER NOT NULL DEFAULT 0
@@ -117,14 +119,17 @@ class Database:
     async def upsert_match(
         self, match_id: int, home_team: str, away_team: str,
         kickoff_utc: str, status: str, result: str | None,
+        home_score: int | None = None, away_score: int | None = None,
     ) -> None:
         async with aiosqlite.connect(self.path) as connection:
             await connection.execute(
-                """INSERT INTO matches (match_id, home_team, away_team, kickoff_utc, status, result)
-                   VALUES (?, ?, ?, ?, ?, ?)
+                """INSERT INTO matches
+                       (match_id, home_team, away_team, kickoff_utc, status, result, home_score, away_score)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(match_id) DO UPDATE SET
-                       status = excluded.status, result = excluded.result""",
-                (match_id, home_team, away_team, kickoff_utc, status, result),
+                       status = excluded.status, result = excluded.result,
+                       home_score = excluded.home_score, away_score = excluded.away_score""",
+                (match_id, home_team, away_team, kickoff_utc, status, result, home_score, away_score),
             )
             await connection.commit()
 
@@ -171,7 +176,84 @@ class Database:
             )
             await connection.commit()
 
-    # ----------------------------------------------------------- scoring --
+    async def get_team_form(self, team: str, limit: int = 5) -> list[dict]:
+        """Last `limit` finished matches for a team, oldest first (standard
+        football 'form guide' order). Each entry: {'outcome': 'W'/'D'/'L',
+        'opponent': str, 'home_score': int|None, 'away_score': int|None,
+        'was_home': bool}."""
+        async with aiosqlite.connect(self.path) as connection:
+            connection.row_factory = aiosqlite.Row
+            cursor = await connection.execute(
+                """SELECT * FROM matches
+                   WHERE status = 'FINISHED' AND (home_team = ? OR away_team = ?)
+                   ORDER BY kickoff_utc DESC LIMIT ?""",
+                (team, team, limit),
+            )
+            rows = await cursor.fetchall()
+
+        form = []
+        for row in reversed(rows):  # oldest first
+            was_home = row["home_team"] == team
+            if row["result"] == "DRAW":
+                outcome = "D"
+            elif (row["result"] == "HOME") == was_home:
+                outcome = "W"
+            else:
+                outcome = "L"
+            form.append({
+                "outcome": outcome,
+                "opponent": row["away_team"] if was_home else row["home_team"],
+                "home_score": row["home_score"],
+                "away_score": row["away_score"],
+                "was_home": was_home,
+            })
+        return form
+
+    async def get_user_streak(self, user_id: int) -> tuple[int, int]:
+        """Returns (current_streak, longest_streak) of consecutive correct
+        predictions, ordered by match kickoff time. Only counts predictions
+        that have been scored (i.e. the match has finished)."""
+        async with aiosqlite.connect(self.path) as connection:
+            cursor = await connection.execute(
+                """SELECT p.correct FROM predictions p
+                   JOIN matches m ON m.match_id = p.match_id
+                   WHERE p.user_id = ? AND p.correct IS NOT NULL
+                   ORDER BY m.kickoff_utc ASC""",
+                (user_id,),
+            )
+            rows = await cursor.fetchall()
+
+        results = [row[0] for row in rows]
+        longest = current_run = 0
+        for correct in results:
+            current_run = current_run + 1 if correct else 0
+            longest = max(longest, current_run)
+
+        # current_streak = run at the very end of the sequence (0 if last pick was wrong)
+        current_streak = 0
+        for correct in reversed(results):
+            if not correct:
+                break
+            current_streak += 1
+
+        return current_streak, longest
+
+    async def get_streak_leaderboard(self, limit: int = 10) -> list[tuple[int, str, int, int]]:
+        """Returns [(user_id, display_name, current_streak, longest_streak), ...]
+        for every manager, sorted by current streak descending. Cheap enough
+        to just loop since friend-group scale (dozens of users, not thousands)."""
+        async with aiosqlite.connect(self.path) as connection:
+            cursor = await connection.execute("SELECT user_id, display_name FROM managers")
+            managers = await cursor.fetchall()
+
+        results = []
+        for user_id, display_name in managers:
+            current, longest = await self.get_user_streak(user_id)
+            results.append((user_id, display_name, current, longest))
+        results.sort(key=lambda r: (r[2], r[3]), reverse=True)
+        return results[:limit]
+
+    # -------------------------------------------------------------- scoring --
 
     async def score_match(self, match_id: int) -> ScoreOutcome:
         """Award team points to the two managers involved and prediction
