@@ -22,6 +22,18 @@ class ScoreOutcome:
     prediction_points_awarded: dict[int, int]  # user_id -> points from correct predictions
 
 
+@dataclass(frozen=True)
+class MvpRow:
+    user_id: int
+    manager: str
+    team_points: int
+    prediction_points: int
+
+    @property
+    def total(self) -> int:
+        return self.team_points + self.prediction_points
+
+
 class Database:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -50,9 +62,20 @@ class Database:
                     result TEXT,
                     home_score INTEGER,
                     away_score INTEGER,
+                    matchday INTEGER,
                     poll_channel_id INTEGER,
                     poll_message_id INTEGER,
                     scored INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            await connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS mvp_announcements (
+                    matchday INTEGER PRIMARY KEY,
+                    user_id INTEGER,
+                    total_points INTEGER,
+                    announced_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
                 """
             )
@@ -120,16 +143,20 @@ class Database:
         self, match_id: int, home_team: str, away_team: str,
         kickoff_utc: str, status: str, result: str | None,
         home_score: int | None = None, away_score: int | None = None,
+        matchday: int | None = None,
     ) -> None:
         async with aiosqlite.connect(self.path) as connection:
             await connection.execute(
                 """INSERT INTO matches
-                       (match_id, home_team, away_team, kickoff_utc, status, result, home_score, away_score)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                       (match_id, home_team, away_team, kickoff_utc, status, result,
+                        home_score, away_score, matchday)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(match_id) DO UPDATE SET
                        status = excluded.status, result = excluded.result,
-                       home_score = excluded.home_score, away_score = excluded.away_score""",
-                (match_id, home_team, away_team, kickoff_utc, status, result, home_score, away_score),
+                       home_score = excluded.home_score, away_score = excluded.away_score,
+                       matchday = excluded.matchday""",
+                (match_id, home_team, away_team, kickoff_utc, status, result,
+                 home_score, away_score, matchday),
             )
             await connection.commit()
 
@@ -252,6 +279,85 @@ class Database:
             results.append((user_id, display_name, current, longest))
         results.sort(key=lambda r: (r[2], r[3]), reverse=True)
         return results[:limit]
+
+    # -------------------------------------------------------------- mvp --
+
+    async def matchdays_ready_for_mvp(self) -> list[int]:
+        """Matchdays where every match is FINISHED + scored, and no MVP has
+        been announced for it yet."""
+        async with aiosqlite.connect(self.path) as connection:
+            cursor = await connection.execute(
+                """SELECT matchday FROM matches
+                   WHERE matchday IS NOT NULL
+                   GROUP BY matchday
+                   HAVING SUM(CASE WHEN status != 'FINISHED' OR scored = 0 THEN 1 ELSE 0 END) = 0
+                      AND matchday NOT IN (SELECT matchday FROM mvp_announcements)"""
+            )
+            return [row[0] for row in await cursor.fetchall()]
+
+    async def matchday_scoreboard(self, matchday: int) -> list[MvpRow]:
+        """Combined team + prediction points gained specifically within this
+        matchday (not season-cumulative), one row per manager who scored
+        anything, sorted highest first."""
+        async with aiosqlite.connect(self.path) as connection:
+            connection.row_factory = aiosqlite.Row
+            cursor = await connection.execute(
+                "SELECT * FROM matches WHERE matchday = ? AND status = 'FINISHED'", (matchday,)
+            )
+            matches = await cursor.fetchall()
+            if not matches:
+                return []
+
+            gained: dict[int, list] = {}  # user_id -> [display_name, team_pts, pred_pts]
+
+            for match in matches:
+                home_outcome = {"HOME": "WIN", "AWAY": "LOSS", "DRAW": "DRAW"}[match["result"]]
+                away_outcome = {"HOME": "LOSS", "AWAY": "WIN", "DRAW": "DRAW"}[match["result"]]
+                for team, outcome in ((match["home_team"], home_outcome),
+                                      (match["away_team"], away_outcome)):
+                    row = await connection.execute(
+                        "SELECT user_id, display_name FROM managers WHERE team = ?", (team,)
+                    )
+                    manager = await row.fetchone()
+                    if manager is None:
+                        continue
+                    entry = gained.setdefault(manager["user_id"], [manager["display_name"], 0, 0])
+                    entry[1] += TEAM_POINTS[outcome]
+
+            match_ids = [m["match_id"] for m in matches]
+            placeholders = ",".join("?" * len(match_ids))
+            cursor = await connection.execute(
+                f"""SELECT p.user_id, m.display_name FROM predictions p
+                    JOIN managers m ON m.user_id = p.user_id
+                    WHERE p.match_id IN ({placeholders}) AND p.correct = 1""",
+                match_ids,
+            )
+            for pred_row in await cursor.fetchall():
+                entry = gained.setdefault(pred_row["user_id"], [pred_row["display_name"], 0, 0])
+                entry[2] += PREDICTION_POINTS
+
+        results = [
+            MvpRow(user_id=uid, manager=name, team_points=team_pts, prediction_points=pred_pts)
+            for uid, (name, team_pts, pred_pts) in gained.items()
+        ]
+        results.sort(key=lambda r: r.total, reverse=True)
+        return results
+
+    async def record_mvp_announcement(self, matchday: int, user_id: int | None, total_points: int) -> None:
+        async with aiosqlite.connect(self.path) as connection:
+            await connection.execute(
+                "INSERT OR REPLACE INTO mvp_announcements (matchday, user_id, total_points) VALUES (?, ?, ?)",
+                (matchday, user_id, total_points),
+            )
+            await connection.commit()
+
+    async def latest_mvp(self) -> aiosqlite.Row | None:
+        async with aiosqlite.connect(self.path) as connection:
+            connection.row_factory = aiosqlite.Row
+            cursor = await connection.execute(
+                "SELECT * FROM mvp_announcements ORDER BY matchday DESC LIMIT 1"
+            )
+            return await cursor.fetchone()
 
     # -------------------------------------------------------------- scoring --
 

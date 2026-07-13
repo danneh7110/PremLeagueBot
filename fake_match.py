@@ -72,22 +72,23 @@ def resolve_id(short_id: str) -> int:
     return FAKE_ID_BASE + int(short_id)
 
 
-async def add(short_id: str, home: str, away: str, minutes: int) -> None:
+async def add(short_id: str, home: str, away: str, minutes: int, matchday: int | None) -> None:
     match_id = resolve_id(short_id)
     kickoff = (datetime.now(timezone.utc) + timedelta(minutes=minutes)).isoformat().replace("+00:00", "Z")
     async with aiosqlite.connect(DB_PATH) as conn:
         await conn.execute(
-            """INSERT INTO matches (match_id, home_team, away_team, kickoff_utc, status, result)
-               VALUES (?, ?, ?, ?, 'SCHEDULED', NULL)
+            """INSERT INTO matches (match_id, home_team, away_team, kickoff_utc, status, result, matchday)
+               VALUES (?, ?, ?, ?, 'SCHEDULED', NULL, ?)
                ON CONFLICT(match_id) DO UPDATE SET
                    home_team=excluded.home_team, away_team=excluded.away_team,
                    kickoff_utc=excluded.kickoff_utc, status='SCHEDULED', result=NULL,
-                   home_score=NULL, away_score=NULL,
+                   home_score=NULL, away_score=NULL, matchday=excluded.matchday,
                    poll_message_id=NULL, poll_channel_id=NULL, scored=0""",
-            (match_id, home, away, kickoff),
+            (match_id, home, away, kickoff, matchday),
         )
         await conn.commit()
-    print(f"Added fake match #{short_id} ({match_id}): {home} vs {away}, kickoff {kickoff}.")
+    md_note = f", matchday {matchday}" if matchday is not None else ""
+    print(f"Added fake match #{short_id} ({match_id}): {home} vs {away}, kickoff {kickoff}{md_note}.")
 
 
 async def predict(short_id: str, user_id: str, choice: str) -> None:
@@ -190,14 +191,19 @@ def main() -> None:
 
     if cmd == "add":
         minutes = 2
+        matchday = None
         if "--minutes" in rest:
             i = rest.index("--minutes")
             minutes = int(rest[i + 1])
             rest = rest[:i] + rest[i + 2:]
+        if "--matchday" in rest:
+            i = rest.index("--matchday")
+            matchday = int(rest[i + 1])
+            rest = rest[:i] + rest[i + 2:]
         if len(rest) != 3:
-            print('Usage: fake_match.py add <id> "<home>" "<away>" [--minutes N]')
+            print('Usage: fake_match.py add <id> "<home>" "<away>" [--minutes N] [--matchday N]')
             return
-        asyncio.run(add(rest[0], rest[1], rest[2], minutes))
+        asyncio.run(add(rest[0], rest[1], rest[2], minutes, matchday))
     elif cmd == "predict":
         if len(rest) != 3:
             print("Usage: fake_match.py predict <id> <user_id> HOME|AWAY|DRAW")

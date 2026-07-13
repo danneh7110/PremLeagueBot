@@ -27,7 +27,6 @@ _SUFFIXES = (" FC", " AFC", " CF")
 
 MANUAL_OVERRIDES: dict[str, str] = {
     # "Brighton & Hove Albion FC": "Brighton",
-    "AFC Bournemouth": "Bournemouth",
 }
 
 
@@ -77,9 +76,14 @@ def parse_match(raw: dict[str, Any]) -> dict[str, Any]:
 
     status = raw["status"]
     result = None
+    home_score = None
+    away_score = None
     if status == "FINISHED":
         winner = raw["score"]["winner"]  # 'HOME_TEAM' | 'AWAY_TEAM' | 'DRAW'
         result = {"HOME_TEAM": "HOME", "AWAY_TEAM": "AWAY", "DRAW": "DRAW"}.get(winner)
+        full_time = raw["score"]["fullTime"]
+        home_score = full_time.get("home")
+        away_score = full_time.get("away")
 
     normalised_status = "FINISHED" if status == "FINISHED" else "SCHEDULED"
 
@@ -90,6 +94,9 @@ def parse_match(raw: dict[str, Any]) -> dict[str, Any]:
         "kickoff_utc": raw["utcDate"],
         "status": normalised_status,
         "result": result,
+        "home_score": home_score,
+        "away_score": away_score,
+        "matchday": raw.get("matchday"),
     }
 
 

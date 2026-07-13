@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 SYNC_INTERVAL_MINUTES = 10
 POLL_WINDOW_HOURS = 24
-ANNOUNCE_CHANNEL_ID = 1525121343316820039  # TODO: replace with your channel id
+ANNOUNCE_CHANNEL_ID = 1525121343316820039 # TODO: replace with your channel id
 
 
 class PredictionView(discord.ui.View):
@@ -248,6 +248,51 @@ class League(commands.Cog):
         )
         await interaction.response.send_message(embed=embed)
 
+    @app_commands.command(name="mvp", description="Show the matchday MVP (or check a specific matchday's scoreboard).")
+    @app_commands.describe(matchday="Leave blank for the latest announced MVP, or check a specific matchday.")
+    async def mvp(self, interaction: discord.Interaction, matchday: int | None = None) -> None:
+        if matchday is not None:
+            scoreboard = await self.database.matchday_scoreboard(matchday)
+            if not scoreboard:
+                await interaction.response.send_message(
+                    f"No finished matches for matchday {matchday} yet.", ephemeral=True
+                )
+                return
+            lines = [
+                f"{'🌟' if i == 0 else f'{i + 1}.'} **{row.manager}** — {row.total} pts "
+                f"({row.team_points} team + {row.prediction_points} predictions)"
+                for i, row in enumerate(scoreboard[:10])
+            ]
+            embed = discord.Embed(
+                title=f"⭐ Matchday {matchday} Scoreboard",
+                description="\n".join(lines),
+                color=discord.Color.purple(),
+            )
+            await interaction.response.send_message(embed=embed)
+            return
+
+        latest = await self.database.latest_mvp()
+        if latest is None:
+            await interaction.response.send_message(
+                "No MVP has been awarded yet — check back once a full matchday finishes.",
+                ephemeral=True,
+            )
+            return
+
+        if latest["user_id"] is None:
+            await interaction.response.send_message(
+                f"Matchday {latest['matchday']} finished with no standout performer — nobody scored."
+            )
+            return
+
+        embed = discord.Embed(
+            title="⭐ Latest Matchday MVP",
+            description=f"<@{latest['user_id']}> — **{latest['total_points']} pts** "
+                        f"in matchday {latest['matchday']}",
+            color=discord.Color.purple(),
+        )
+        await interaction.response.send_message(embed=embed)
+
     # -------------------------------------------------------------- tasks --
 
     @tasks.loop(minutes=SYNC_INTERVAL_MINUTES)
@@ -256,6 +301,7 @@ class League(commands.Cog):
             await self._pull_latest_matches()
             await self._post_new_polls()
             await self._score_finished_matches()
+            await self._announce_mvp()
         except football_api.FootballAPIError as exc:
             logger.warning("Football API error during sync: %s", exc)
         except Exception:
@@ -342,6 +388,41 @@ class League(commands.Cog):
                 content = "Nobody predicted this one correctly. 😬"
 
             await channel.send(content=content, embed=embed)
+
+    async def _announce_mvp(self):
+        channel = self.bot.get_channel(ANNOUNCE_CHANNEL_ID)
+        for matchday in await self.database.matchdays_ready_for_mvp():
+            scoreboard = await self.database.matchday_scoreboard(matchday)
+
+            if not scoreboard or scoreboard[0].total <= 0:
+                # Nothing worth announcing (no one managed a scoring team or
+                # predicted correctly this week) - still record it so we
+                # don't re-check this matchday every sync forever.
+                await self.database.record_mvp_announcement(matchday, None, 0)
+                continue
+
+            top_total = scoreboard[0].total
+            winners = [row for row in scoreboard if row.total == top_total]
+            winner_id = winners[0].user_id if len(winners) == 1 else None
+            await self.database.record_mvp_announcement(matchday, winner_id, top_total)
+
+            if channel is None:
+                continue
+
+            mentions = " ".join(f"<@{w.user_id}>" for w in winners)
+            title = "⭐ Matchday MVP!" if len(winners) == 1 else "⭐ Matchday MVPs (tied)!"
+            lines = [
+                f"**{row.manager}** — {row.total} pts this week "
+                f"({row.team_points} team + {row.prediction_points} predictions)"
+                for row in scoreboard[:5]
+            ]
+            embed = discord.Embed(
+                title=title,
+                description=f"Matchday {matchday} top performer{'s' if len(winners) > 1 else ''}:\n\n"
+                            + "\n".join(lines),
+                color=discord.Color.purple(),
+            )
+            await channel.send(content=f"{mentions} 🏅", embed=embed)
 
 
 def _to_unix(iso_utc: str) -> int:
