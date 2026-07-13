@@ -15,7 +15,7 @@ DB_PATH = Path(__file__).parents[1] / "database.db"
 
 logger = logging.getLogger(__name__)
 
-SYNC_INTERVAL_MINUTES = 10
+SYNC_INTERVAL_MINUTES = 1
 POLL_WINDOW_HOURS = 24
 ANNOUNCE_CHANNEL_ID = 1525121343316820039 # TODO: replace with your channel id
 
@@ -301,7 +301,7 @@ class League(commands.Cog):
             await self._pull_latest_matches()
             await self._post_new_polls()
             await self._score_finished_matches()
-            await self._announce_mvp()
+            await self._post_gameweek_review()
         except football_api.FootballAPIError as exc:
             logger.warning("Football API error during sync: %s", exc)
         except Exception:
@@ -389,16 +389,17 @@ class League(commands.Cog):
 
             await channel.send(content=content, embed=embed)
 
-    async def _announce_mvp(self):
+    async def _post_gameweek_review(self):
+        """Post a full gameweek review embed once all matches in a matchday
+        have been scored. Replaces the old MVP-only announcement."""
         channel = self.bot.get_channel(ANNOUNCE_CHANNEL_ID)
         for matchday in await self.database.matchdays_ready_for_mvp():
             scoreboard = await self.database.matchday_scoreboard(matchday)
+            all_positions = await self.database.get_current_positions()
 
             if not scoreboard or scoreboard[0].total <= 0:
-                # Nothing worth announcing (no one managed a scoring team or
-                # predicted correctly this week) - still record it so we
-                # don't re-check this matchday every sync forever.
                 await self.database.record_mvp_announcement(matchday, None, 0)
+                await self.database.snapshot_current_positions(matchday)
                 continue
 
             top_total = scoreboard[0].total
@@ -407,22 +408,88 @@ class League(commands.Cog):
             await self.database.record_mvp_announcement(matchday, winner_id, top_total)
 
             if channel is None:
+                await self.database.snapshot_current_positions(matchday)
                 continue
 
-            mentions = " ".join(f"<@{w.user_id}>" for w in winners)
-            title = "⭐ Matchday MVP!" if len(winners) == 1 else "⭐ Matchday MVPs (tied)!"
-            lines = [
-                f"**{row.manager}** — {row.total} pts this week "
-                f"({row.team_points} team + {row.prediction_points} predictions)"
-                for row in scoreboard[:5]
-            ]
+            # --- Build the embed ---
+
+            description_lines = []
+
+            # 👑 MVP
+            mvp_name = winners[0].manager
+            mvp_pts = winners[0].total
+            description_lines.append(f"**👑 MVP**\n{mvp_name} (+{mvp_pts} pts)\n")
+
+            # 🥇 Top Three (overall league positions)
+            top_three = all_positions[:3]
+            medals = {0: "🥇", 1: "🥈", 2: "🥉"}
+            top_lines = []
+            for i, entry in enumerate(top_three):
+                top_lines.append(f"{medals[i]} {entry['display_name']} — {entry['total_points']}")
+            description_lines.append(f"**🥇 Top Three**\n" + "\n".join(top_lines) + "\n")
+
+            # 📈 Biggest Climber / 📉 Biggest Faller (compare to previous gameweek snapshot)
+            previous_matchday = matchday - 1
+            prev_positions = await self.database.get_previous_positions(previous_matchday)
+            if prev_positions:
+                position_changes = []
+                for entry in all_positions:
+                    uid = entry["user_id"]
+                    if uid in prev_positions:
+                        old_pos = prev_positions[uid]["position"]
+                        change = old_pos - entry["position"]  # positive = climbed
+                        if change != 0:
+                            position_changes.append((change, entry["display_name"], old_pos, entry["position"]))
+
+                if position_changes:
+                    position_changes.sort(key=lambda x: -x[0])
+                    biggest_climber = position_changes[0]
+                    description_lines.append(
+                        f"**📈 Biggest Climber**\n{biggest_climber[1]}\n"
+                        f"`#{biggest_climber[2]}` → `#{biggest_climber[3]}` (+{biggest_climber[0]})\n"
+                    )
+
+                    biggest_faller = position_changes[-1]
+                    if biggest_faller[0] < 0:
+                        description_lines.append(
+                            f"**📉 Biggest Faller**\n{biggest_faller[1]}\n"
+                            f"`#{biggest_faller[3]}` → `#{biggest_faller[2]}` ({biggest_faller[0]})\n"
+                        )
+
+            # 🔥 Prediction Streaks
+            streaks = await self.database.get_streak_leaderboard(limit=3)
+            if streaks:
+                streak_medals = {0: "🥇", 1: "🥈", 2: "🥉"}
+                streak_lines = []
+                for i, (uid, name, current, _) in enumerate(streaks):
+                    flame = " 🔥" * min(current, 3) if current >= 3 else ""
+                    streak_lines.append(f"{streak_medals[i]} {name} — {current}{flame}")
+                description_lines.append("**🔥 Prediction Streaks**\n" + "\n".join(streak_lines) + "\n")
+
+            # ⭐ Biggest Upset
+            upset = await self.database.get_biggest_upset(matchday)
+            if upset is not None and upset["correct_pct"] < 100:
+                home = self.team_label(upset["home_team"])
+                away = self.team_label(upset["away_team"])
+                score = f"{upset['home_score']}-{upset['away_score']}"
+                pct = round(upset["correct_pct"])
+                description_lines.append(
+                    f"**⭐ Biggest Upset**\n{home} {score} {away}\n"
+                    f"Only {pct}% predicted correctly.\n"
+                )
+
             embed = discord.Embed(
-                title=title,
-                description=f"Matchday {matchday} top performer{'s' if len(winners) > 1 else ''}:\n\n"
-                            + "\n".join(lines),
-                color=discord.Color.purple(),
+                title=f"🏆 Gameweek {matchday} Review",
+                description="\n".join(description_lines),
+                color=discord.Color.gold(),
             )
+
+            # Ping the MVP winner(s)
+            mentions = " ".join(f"<@{w.user_id}>" for w in winners)
             await channel.send(content=f"{mentions} 🏅", embed=embed)
+
+            # Take a position snapshot for next gameweek's comparison
+            await self.database.snapshot_current_positions(matchday)
 
 
 def _to_unix(iso_utc: str) -> int:

@@ -90,6 +90,17 @@ class Database:
                 )
                 """
             )
+            await connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS gameweek_snapshots (
+                    matchday INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    position INTEGER NOT NULL,
+                    total_points INTEGER NOT NULL,
+                    PRIMARY KEY (matchday, user_id)
+                )
+                """
+            )
             await connection.commit()
 
     # ---------------------------------------------------------- managers --
@@ -358,6 +369,88 @@ class Database:
                 "SELECT * FROM mvp_announcements ORDER BY matchday DESC LIMIT 1"
             )
             return await cursor.fetchone()
+
+    # ------------------------------------------------ gameweek snapshots --
+
+    async def get_current_positions(self) -> list[dict]:
+        """Return the current league standings with 1-based positions.
+        Each dict: {user_id, display_name, team, total_points, position}."""
+        async with aiosqlite.connect(self.path) as connection:
+            cursor = await connection.execute(
+                "SELECT user_id, display_name, team, points, prediction_points, "
+                "(points + prediction_points) AS total FROM managers "
+                "ORDER BY total DESC, team COLLATE NOCASE"
+            )
+            rows = await cursor.fetchall()
+
+        return [
+            {
+                "user_id": row[0],
+                "display_name": row[1],
+                "team": row[2],
+                "total_points": row[5],
+                "position": i + 1,
+            }
+            for i, row in enumerate(rows)
+        ]
+
+    async def get_previous_positions(self, matchday: int) -> dict[int, dict]:
+        """Get the stored snapshot for a previous matchday.
+        Returns {user_id: {position, total_points}}."""
+        async with aiosqlite.connect(self.path) as connection:
+            cursor = await connection.execute(
+                "SELECT user_id, position, total_points FROM gameweek_snapshots WHERE matchday = ?",
+                (matchday,),
+            )
+            rows = await cursor.fetchall()
+        return {row[0]: {"position": row[1], "total_points": row[2]} for row in rows}
+
+    async def snapshot_current_positions(self, matchday: int) -> None:
+        """Take a snapshot of every manager's current position after a matchday
+        so we can track climbers/fallers in the next review."""
+        positions = await self.get_current_positions()
+        async with aiosqlite.connect(self.path) as connection:
+            for entry in positions:
+                await connection.execute(
+                    "INSERT OR REPLACE INTO gameweek_snapshots (matchday, user_id, position, total_points) "
+                    "VALUES (?, ?, ?, ?)",
+                    (matchday, entry["user_id"], entry["position"], entry["total_points"]),
+                )
+            await connection.commit()
+
+    async def get_biggest_upset(self, matchday: int) -> dict | None:
+        """Find the match in a matchday with the lowest % of correct predictions.
+        Returns {match_id, home_team, away_team, home_score, away_score,
+        total_predictions, correct_predictions, correct_pct} or None."""
+        async with aiosqlite.connect(self.path) as connection:
+            connection.row_factory = aiosqlite.Row
+            # Get all finished matches for this matchday that have predictions
+            cursor = await connection.execute(
+                """SELECT m.match_id, m.home_team, m.away_team, m.home_score, m.away_score,
+                          COUNT(p.user_id) AS total_preds,
+                          SUM(p.correct) AS correct_preds
+                   FROM matches m
+                   JOIN predictions p ON p.match_id = m.match_id
+                   WHERE m.matchday = ? AND m.status = 'FINISHED'
+                   GROUP BY m.match_id
+                   HAVING total_preds > 0
+                   ORDER BY (CAST(correct_preds AS FLOAT) / total_preds) ASC
+                   LIMIT 1""",
+                (matchday,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return None
+            return {
+                "match_id": row["match_id"],
+                "home_team": row["home_team"],
+                "away_team": row["away_team"],
+                "home_score": row["home_score"],
+                "away_score": row["away_score"],
+                "total_predictions": row["total_preds"],
+                "correct_predictions": row["correct_preds"],
+                "correct_pct": (row["correct_preds"] / row["total_preds"]) * 100 if row["total_preds"] > 0 else 0,
+            }
 
     # -------------------------------------------------------------- scoring --
 
