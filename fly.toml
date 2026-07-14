@@ -1,5 +1,12 @@
+# fly.toml app configuration file generated for premleaguebot on 2026-07-14T15:11:26Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
 app = 'premleaguebot'
-primary_region = 'ams'
+primary_region = 'lhr'
+
+[build]
 
 [env]
   PORT = '8080'
