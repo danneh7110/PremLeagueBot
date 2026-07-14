@@ -1,0 +1,9 @@
+.venv
+__pycache__
+*.pyc
+.env
+database.db
+.git
+.gitignore
+fake_match.py
+cleanup_test_data.sql

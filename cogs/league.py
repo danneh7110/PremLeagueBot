@@ -1,4 +1,5 @@
 import logging
+import os
 import random
 import re
 from pathlib import Path
@@ -11,11 +12,11 @@ from utils import football_api
 from utils.database import Database
 
 DATA_DIR = Path(__file__).parents[1] / "data"
-DB_PATH = Path(__file__).parents[1] / "database.db"
+DB_PATH = Path(os.environ.get("DATABASE_PATH", str(Path(__file__).parents[1] / "database.db")))
 
 logger = logging.getLogger(__name__)
 
-SYNC_INTERVAL_MINUTES = 1
+SYNC_INTERVAL_MINUTES = 10
 POLL_WINDOW_HOURS = 24
 ANNOUNCE_CHANNEL_ID = 1525121343316820039 # TODO: replace with your channel id
 
@@ -425,7 +426,7 @@ class League(commands.Cog):
             medals = {0: "🥇", 1: "🥈", 2: "🥉"}
             top_lines = []
             for i, entry in enumerate(top_three):
-                top_lines.append(f"{medals[i]} {entry['display_name']} — {entry['total_points']}")
+                top_lines.append(f"{medals[i]} {entry['display_name']} - {entry['total_points']}pts")
             description_lines.append(f"**🥇 Top Three**\n" + "\n".join(top_lines) + "\n")
 
             # 📈 Biggest Climber / 📉 Biggest Faller (compare to previous gameweek snapshot)
@@ -446,35 +447,33 @@ class League(commands.Cog):
                     biggest_climber = position_changes[0]
                     description_lines.append(
                         f"**📈 Biggest Climber**\n{biggest_climber[1]}\n"
-                        f"`#{biggest_climber[2]}` → `#{biggest_climber[3]}` (+{biggest_climber[0]})\n"
+                        f"{_ordinal(biggest_climber[2])} → {_ordinal(biggest_climber[3])} (+{biggest_climber[0]})\n"
                     )
 
                     biggest_faller = position_changes[-1]
                     if biggest_faller[0] < 0:
                         description_lines.append(
                             f"**📉 Biggest Faller**\n{biggest_faller[1]}\n"
-                            f"`#{biggest_faller[3]}` → `#{biggest_faller[2]}` ({biggest_faller[0]})\n"
+                            f"{_ordinal(biggest_faller[2])} → {_ordinal(biggest_faller[3])} ({biggest_faller[0]})\n"
                         )
 
             # 🔥 Prediction Streaks
             streaks = await self.database.get_streak_leaderboard(limit=3)
+            streaks = [s for s in streaks if s[2] > 0]  # only show active streaks
             if streaks:
                 streak_medals = {0: "🥇", 1: "🥈", 2: "🥉"}
                 streak_lines = []
                 for i, (uid, name, current, _) in enumerate(streaks):
-                    flame = " 🔥" * min(current, 3) if current >= 3 else ""
-                    streak_lines.append(f"{streak_medals[i]} {name} — {current}{flame}")
+                    streak_lines.append(f"{streak_medals[i]} {name} - {current} correct")
                 description_lines.append("**🔥 Prediction Streaks**\n" + "\n".join(streak_lines) + "\n")
 
             # ⭐ Biggest Upset
             upset = await self.database.get_biggest_upset(matchday)
             if upset is not None and upset["correct_pct"] < 100:
-                home = self.team_label(upset["home_team"])
-                away = self.team_label(upset["away_team"])
-                score = f"{upset['home_score']}-{upset['away_score']}"
+                score = f"{upset['home_score']}–{upset['away_score']}"
                 pct = round(upset["correct_pct"])
                 description_lines.append(
-                    f"**⭐ Biggest Upset**\n{home} {score} {away}\n"
+                    f"**⭐ Biggest Upset**\n{upset['home_team']} {score} {upset['away_team']}\n"
                     f"Only {pct}% predicted correctly.\n"
                 )
 
@@ -495,6 +494,14 @@ class League(commands.Cog):
 def _to_unix(iso_utc: str) -> int:
     from datetime import datetime
     return int(datetime.fromisoformat(iso_utc.replace("Z", "+00:00")).timestamp())
+
+
+def _ordinal(n: int) -> str:
+    if 10 <= n % 100 <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
 
 
 async def setup(bot: commands.Bot) -> None:
